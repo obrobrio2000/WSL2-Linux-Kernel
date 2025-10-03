@@ -87,12 +87,23 @@ struct wsl_usb_urb_response {
 	/* Followed by response data */
 } __packed;
 
+// Pending URB structure for tracking
+struct wsl_usb_pending_urb {
+	struct urb *urb;
+	u32 sequence_number;
+	unsigned long submit_time;
+	struct list_head list;
+};
+
 // Virtual USB device structure
 struct wsl_vusb_device {
 	struct usb_device *udev;
 	char instance_id[256];
 	__u16 vendor_id;
 	__u16 product_id;
+	__u8 device_class;
+	__u8 device_subclass;
+	__u8 device_protocol;
 	struct list_head list;
 };
 
@@ -101,8 +112,11 @@ struct wsl_usb_hcd {
 	struct socket *hv_socket;
 	struct task_struct *receiver_thread;
 	struct list_head devices;
+	struct list_head pending_urbs;
 	spinlock_t lock;
+	spinlock_t urb_lock;
 	bool running;
+	atomic_t sequence_counter;
 };
 
 static struct platform_device *wsl_usb_platform_device;
@@ -229,16 +243,175 @@ static int wsl_usb_receiver_thread(void *data)
 
 		// Process message based on type
 		switch (header.type) {
-		case WSL_USB_MSG_URB_RESPONSE:
-			// Handle URB response
-			if (payload) {
-				// Complete pending URB
-				// This would match sequence number to pending URB and complete it
+		case WSL_USB_MSG_DEVICE_ATTACH:
+		{
+			struct wsl_usb_attach_request *attach_req;
+			struct wsl_usb_attach_response attach_resp;
+			struct wsl_vusb_device *vdev;
+
+			if (payload_size < sizeof(*attach_req)) {
+				pr_err("Invalid attach request size\n");
+				break;
 			}
+
+			attach_req = (struct wsl_usb_attach_request *)payload;
+			pr_info("Received device attach: %s\n", attach_req->instance_id);
+
+			// Create virtual USB device
+			vdev = kzalloc(sizeof(*vdev), GFP_KERNEL);
+			if (!vdev) {
+				attach_resp.status = -ENOMEM;
+				snprintf(attach_resp.error_message, sizeof(attach_resp.error_message),
+					"Failed to allocate device structure");
+			} else {
+				strncpy(vdev->instance_id, attach_req->instance_id, sizeof(vdev->instance_id) - 1);
+				
+				// Add to device list
+				spin_lock(&wsl_hcd->lock);
+				list_add_tail(&vdev->list, &wsl_hcd->devices);
+				spin_unlock(&wsl_hcd->lock);
+
+				attach_resp.status = 0;
+				attach_resp.error_message[0] = '\0';
+				
+				pr_info("Virtual USB device created: %s\n", vdev->instance_id);
+				
+				// TODO: Register USB device with USB core
+				// This would call usb_alloc_dev(), fill in device descriptor, 
+				// and call usb_new_device()
+			}
+
+			// Send response
+			wsl_usb_send_message(wsl_hcd->hv_socket, WSL_USB_MSG_DEVICE_ATTACH,
+					    &attach_resp, sizeof(attach_resp));
 			break;
+		}
+
+		case WSL_USB_MSG_DEVICE_DETACH:
+		{
+			struct wsl_usb_attach_request *detach_req;
+			struct wsl_vusb_device *vdev, *tmp;
+
+			if (payload_size < sizeof(*detach_req)) {
+				pr_err("Invalid detach request size\n");
+				break;
+			}
+
+			detach_req = (struct wsl_usb_attach_request *)payload;
+			pr_info("Received device detach: %s\n", detach_req->instance_id);
+
+			// Find and remove device
+			spin_lock(&wsl_hcd->lock);
+			list_for_each_entry_safe(vdev, tmp, &wsl_hcd->devices, list) {
+				if (strcmp(vdev->instance_id, detach_req->instance_id) == 0) {
+					list_del(&vdev->list);
+					spin_unlock(&wsl_hcd->lock);
+					
+					// TODO: Unregister USB device
+					// This would call usb_disconnect() and usb_put_dev()
+					
+					kfree(vdev);
+					pr_info("Virtual USB device removed: %s\n", detach_req->instance_id);
+					goto detach_done;
+				}
+			}
+			spin_unlock(&wsl_hcd->lock);
+			pr_warn("Device not found for detach: %s\n", detach_req->instance_id);
+
+detach_done:
+			break;
+		}
+
+		case WSL_USB_MSG_URB_RESPONSE:
+		{
+			struct wsl_usb_urb_response *urb_resp;
+			struct wsl_usb_pending_urb *pending, *tmp;
+			struct urb *urb = NULL;
+			u8 *response_data;
+			u32 response_data_size;
+			int status;
+			bool found = false;
+			
+			if (payload_size < sizeof(*urb_resp)) {
+				pr_err("Invalid URB response size\n");
+				break;
+			}
+
+			urb_resp = (struct wsl_usb_urb_response *)payload;
+			response_data = (u8*)payload + sizeof(*urb_resp);
+			response_data_size = payload_size - sizeof(*urb_resp);
+			
+			// Find pending URB by sequence number (matches header.sequence_number)
+			spin_lock(&wsl_hcd->urb_lock);
+			list_for_each_entry_safe(pending, tmp, &wsl_hcd->pending_urbs, list) {
+				if (pending->sequence_number == header.sequence_number) {
+					urb = pending->urb;
+					list_del(&pending->list);
+					kfree(pending);
+					found = true;
+					break;
+				}
+			}
+			spin_unlock(&wsl_hcd->urb_lock);
+
+			if (!found) {
+				pr_warn("URB response for unknown sequence: %u\n", header.sequence_number);
+				break;
+			}
+
+			if (!urb) {
+				pr_err("NULL URB in pending list\n");
+				break;
+			}
+
+			// Map Windows status to Linux error code
+			if (urb_resp->status == 0) {
+				status = 0;
+			} else {
+				// Windows error codes -> Linux error codes
+				// This is simplified; production code needs complete mapping
+				switch (urb_resp->status) {
+				case 0xC0000001: // STATUS_UNSUCCESSFUL
+					status = -EIO;
+					break;
+				case 0xC000009A: // STATUS_INSUFFICIENT_RESOURCES
+					status = -ENOMEM;
+					break;
+				case 0xC0000120: // STATUS_CANCELLED
+					status = -ECONNRESET;
+					break;
+				case 0xC0000011: // STATUS_END_OF_FILE
+					status = -EPIPE;
+					break;
+				case 0x00000103: // STATUS_PENDING
+					status = -EINPROGRESS;
+					break;
+				default:
+					status = -EIO;
+					break;
+				}
+			}
+
+			// Copy response data for IN transfers
+			if (usb_pipein(urb->pipe) && response_data_size > 0 && urb->transfer_buffer) {
+				u32 copy_size = min((u32)urb->transfer_buffer_length, response_data_size);
+				memcpy(urb->transfer_buffer, response_data, copy_size);
+				urb->actual_length = copy_size;
+			} else {
+				urb->actual_length = urb_resp->transferred_length;
+			}
+
+			pr_debug("URB completed: seq=%u, status=%d, actual_len=%u\n",
+				 header.sequence_number, status, urb->actual_length);
+
+			// Complete the URB
+			usb_hcd_giveback_urb(hcd, urb, status);
+			break;
+		}
 
 		case WSL_USB_MSG_DEVICE_EVENT:
 			// Handle device hotplug events
+			pr_info("Received device event\n");
 			break;
 
 		default:
@@ -294,8 +467,11 @@ static int wsl_usb_hcd_start(struct usb_hcd *hcd)
 	pr_info("Starting WSL USB HCD\n");
 
 	INIT_LIST_HEAD(&wsl_hcd->devices);
+	INIT_LIST_HEAD(&wsl_hcd->pending_urbs);
 	spin_lock_init(&wsl_hcd->lock);
+	spin_lock_init(&wsl_hcd->urb_lock);
 	wsl_hcd->running = true;
+	atomic_set(&wsl_hcd->sequence_counter, 0);
 
 	// Connect to Windows host
 	ret = wsl_usb_connect_to_host(wsl_hcd);
@@ -320,6 +496,7 @@ static int wsl_usb_hcd_start(struct usb_hcd *hcd)
 static void wsl_usb_hcd_stop(struct usb_hcd *hcd)
 {
 	struct wsl_usb_hcd *wsl_hcd = hcd_to_wsl_hcd(hcd);
+	struct wsl_usb_pending_urb *pending, *tmp;
 
 	pr_info("Stopping WSL USB HCD\n");
 
@@ -335,32 +512,172 @@ static void wsl_usb_hcd_stop(struct usb_hcd *hcd)
 		wsl_hcd->hv_socket = NULL;
 	}
 
+	// Cancel all pending URBs
+	spin_lock(&wsl_hcd->urb_lock);
+	list_for_each_entry_safe(pending, tmp, &wsl_hcd->pending_urbs, list) {
+		list_del(&pending->list);
+		if (pending->urb) {
+			pending->urb->status = -ESHUTDOWN;
+			usb_hcd_giveback_urb(hcd, pending->urb, -ESHUTDOWN);
+		}
+		kfree(pending);
+	}
+	spin_unlock(&wsl_hcd->urb_lock);
+
 	hcd->state = HC_STATE_HALT;
+}
+
+// Find virtual device by USB device
+static struct wsl_vusb_device *wsl_usb_find_vdev(struct wsl_usb_hcd *wsl_hcd, struct usb_device *udev)
+{
+	struct wsl_vusb_device *vdev;
+	
+	spin_lock(&wsl_hcd->lock);
+	list_for_each_entry(vdev, &wsl_hcd->devices, list) {
+		if (vdev->udev == udev) {
+			spin_unlock(&wsl_hcd->lock);
+			return vdev;
+		}
+	}
+	spin_unlock(&wsl_hcd->lock);
+	
+	return NULL;
+}
+
+// Map Linux USB pipe to URB function code
+static u16 wsl_usb_get_urb_function(struct urb *urb)
+{
+	int pipe = urb->pipe;
+	
+	if (usb_pipecontrol(pipe)) {
+		// Check if this is a descriptor request
+		if (urb->setup_packet) {
+			struct usb_ctrlrequest *setup = (struct usb_ctrlrequest *)urb->setup_packet;
+			if ((setup->bRequestType & USB_TYPE_MASK) == USB_TYPE_STANDARD &&
+			    setup->bRequest == USB_REQ_GET_DESCRIPTOR) {
+				// GET_DESCRIPTOR
+				u8 desc_type = setup->wValue >> 8;
+				if (desc_type == USB_DT_DEVICE)
+					return 0x000B; // URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE
+				else if (desc_type == USB_DT_CONFIG)
+					return 0x000B;
+				else if (desc_type == USB_DT_STRING)
+					return 0x000B;
+			} else if (setup->bRequest == USB_REQ_SET_CONFIGURATION) {
+				return 0x0000; // URB_FUNCTION_SELECT_CONFIGURATION
+			} else if (setup->bRequest == USB_REQ_SET_INTERFACE) {
+				return 0x0001; // URB_FUNCTION_SELECT_INTERFACE
+			}
+		}
+		return 0x0008; // URB_FUNCTION_CONTROL_TRANSFER
+	} else if (usb_pipebulk(pipe)) {
+		return 0x0009; // URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER
+	} else if (usb_pipeint(pipe)) {
+		return 0x0009; // URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER
+	} else if (usb_pipeisoc(pipe)) {
+		return 0x000A; // URB_FUNCTION_ISOCH_TRANSFER
+	}
+	
+	return 0x0008; // Default to control transfer
 }
 
 // URB enqueue - forward to Windows host
 static int wsl_usb_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb, gfp_t mem_flags)
 {
 	struct wsl_usb_hcd *wsl_hcd = hcd_to_wsl_hcd(hcd);
-	struct wsl_usb_urb_request request;
+	struct wsl_vusb_device *vdev;
+	struct wsl_usb_pending_urb *pending;
+	struct wsl_usb_urb_request *request;
+	size_t request_size;
+	size_t transfer_size;
+	u32 sequence;
 	int ret;
+	void *request_buffer;
+
+	if (!urb || !urb->dev) {
+		pr_err("Invalid URB or device\n");
+		return -EINVAL;
+	}
+
+	// Find virtual device
+	vdev = wsl_usb_find_vdev(wsl_hcd, urb->dev);
+	if (!vdev) {
+		pr_err("Device not found for URB\n");
+		return -ENODEV;
+	}
+
+	// Allocate pending URB structure
+	pending = kzalloc(sizeof(*pending), GFP_ATOMIC);
+	if (!pending)
+		return -ENOMEM;
+
+	// Generate sequence number
+	sequence = atomic_inc_return(&wsl_hcd->sequence_counter);
+	
+	pending->urb = urb;
+	pending->sequence_number = sequence;
+	pending->submit_time = jiffies;
+
+	// Add to pending list
+	spin_lock(&wsl_hcd->urb_lock);
+	list_add_tail(&pending->list, &wsl_hcd->pending_urbs);
+	spin_unlock(&wsl_hcd->urb_lock);
+
+	// Calculate transfer size for OUT transfers
+	transfer_size = 0;
+	if (usb_pipeout(urb->pipe) && urb->transfer_buffer_length > 0)
+		transfer_size = urb->transfer_buffer_length;
+
+	// Allocate request buffer
+	request_size = sizeof(struct wsl_usb_urb_request) + transfer_size;
+	request_buffer = kmalloc(request_size, GFP_KERNEL);
+	if (!request_buffer) {
+		ret = -ENOMEM;
+		goto error_remove_pending;
+	}
+
+	request = (struct wsl_usb_urb_request *)request_buffer;
 
 	// Build URB request
-	memset(&request, 0, sizeof(request));
-	// Fill in device instance ID from urb->dev
-	request.transfer_buffer_length = urb->transfer_buffer_length;
-	request.endpoint = usb_pipeendpoint(urb->pipe);
+	memset(request, 0, sizeof(*request));
+	strncpy(request->instance_id, vdev->instance_id, sizeof(request->instance_id) - 1);
+	request->function = wsl_usb_get_urb_function(urb);
+	request->transfer_buffer_length = urb->transfer_buffer_length;
+	request->endpoint = usb_pipeendpoint(urb->pipe);
+	
+	// Set flags based on pipe direction
+	request->flags = usb_pipein(urb->pipe) ? 0x01 : 0x00; // USBD_TRANSFER_DIRECTION_IN
 
-	// Send URB request to host
+	// Copy transfer buffer for OUT transfers
+	if (transfer_size > 0) {
+		memcpy((u8*)request_buffer + sizeof(*request), 
+		       urb->transfer_buffer, 
+		       transfer_size);
+	}
+
+	// Send URB request to host with sequence number
 	ret = wsl_usb_send_message(wsl_hcd->hv_socket, WSL_USB_MSG_URB_REQUEST,
-				   &request, sizeof(request));
+				   request_buffer, request_size);
+	
+	kfree(request_buffer);
+
 	if (ret < 0) {
 		pr_err("Failed to send URB request: %d\n", ret);
-		return ret;
+		goto error_remove_pending;
 	}
+
+	pr_debug("URB enqueued: seq=%u, func=0x%04x, ep=0x%02x, len=%u\n",
+		 sequence, request->function, request->endpoint, request->transfer_buffer_length);
 
 	// URB will be completed when response is received
 	return 0;
+
+error_remove_pending:
+	spin_lock(&wsl_hcd->urb_lock);
+	list_del(&pending->list);
+	spin_unlock(&wsl_hcd->urb_lock);
+	kfree(pending);
+	return ret;
 }
 
 // URB dequeue
