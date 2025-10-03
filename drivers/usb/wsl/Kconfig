@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config USB_WSL
+	tristate "WSL USB Passthrough Support"
+	depends on USB && HYPERV && VSOCKETS
+	help
+	  This driver provides USB device passthrough for WSL2 over Hyper-V
+	  sockets. It enables USB devices connected to the Windows host to
+	  be used in the Linux guest without relying on IP networking (usbip).
+
+	  This is a more robust alternative to usbip that works regardless of
+	  VPN configurations, network changes, or complex networking setups.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called wsl_usb.
+
+	  If unsure, say N.
